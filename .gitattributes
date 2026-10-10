@@ -1,0 +1,2 @@
+# LF everywhere, so Docker builds from a Windows checkout match CI (gofmt rejects CRLF).
+* text=auto eol=lf
