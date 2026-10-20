@@ -65,6 +65,30 @@ func TestLifecycle(t *testing.T) {
 		t.Errorf("stats has %d counters, want %d", len(stats), len(StatNames))
 	}
 
+	// The allowlist lives in a pinned map and survives CLI invocations.
+	for _, cidr := range []string{"192.0.2.0/24", "2001:db8::/32"} {
+		if err := Allow(cidr); err != nil {
+			t.Fatalf("allow %s: %v", cidr, err)
+		}
+	}
+	entries, err := Allowlist()
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := []string{"192.0.2.0/24", "2001:db8::/32"}
+	if len(entries) != len(want) || entries[0] != want[0] || entries[1] != want[1] {
+		t.Errorf("allowlist = %v, want %v", entries, want)
+	}
+	if err := Disallow("192.0.2.0/24"); err != nil {
+		t.Fatal(err)
+	}
+	if entries, err = Allowlist(); err != nil {
+		t.Fatal(err)
+	}
+	if len(entries) != 1 || entries[0] != want[1] {
+		t.Errorf("allowlist after remove = %v, want [%s]", entries, want[1])
+	}
+
 	if err := Stop(); err != nil {
 		t.Fatal(err)
 	}

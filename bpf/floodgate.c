@@ -40,9 +40,19 @@ struct fg_limit {
 };
 
 struct fg_config {
-	struct fg_limit ip;     // all packets, per source IP
-	struct fg_limit syn;    // TCP SYNs, per source IP
-	struct fg_limit global; // whole node; interval is the per-CPU share
+	struct fg_limit ip;          // all packets, per source IP
+	struct fg_limit syn;         // TCP SYNs, per source IP
+	struct fg_limit trusted_ip;  // same, for allowlisted sources
+	struct fg_limit trusted_syn; // same, for allowlisted sources
+	struct fg_limit global;      // whole node; interval is the per-CPU share
+};
+
+// Longest-prefix-match key for the allowlist. addr is raw network bytes;
+// IPv4 sources are looked up as IPv4-mapped IPv6 (::ffff:a.b.c.d), so one
+// trie holds both families. prefixlen is ignored on lookup.
+struct fg_lpm_key {
+	__u32 prefixlen;
+	__u8 addr[16];
 };
 
 // Source address. IPv4 is stored IPv4-mapped (::ffff:a.b.c.d) so one map
@@ -96,6 +106,17 @@ struct {
 	__type(value, struct fg_ip_state);
 	__uint(pinning, LIBBPF_PIN_BY_NAME);
 } ip_state SEC(".maps");
+
+// Sources that skip the default per-IP class and use the trusted limits
+// instead. LPM trie so operators can allow whole IPv4/IPv6 prefixes.
+struct {
+	__uint(type, BPF_MAP_TYPE_LPM_TRIE);
+	__uint(max_entries, 65536);
+	__type(key, struct fg_lpm_key);
+	__type(value, __u8);
+	__uint(map_flags, BPF_F_NO_PREALLOC);
+	__uint(pinning, LIBBPF_PIN_BY_NAME);
+} allowlist SEC(".maps");
 
 // Node-wide cap, split per CPU: each CPU has its own bucket with
 // 1/Nth of the rate, so no two CPUs ever touch the same memory.
@@ -227,9 +248,20 @@ int xdp_floodgate(struct xdp_md *ctx)
 
 	__u64 now = bpf_ktime_get_ns();
 
+	// Allowlisted sources use the trusted class. The lookup is only a
+	// trie walk; the global cap below still applies to trusted traffic.
+	const struct fg_limit *ip_limit = &cfg->ip;
+	const struct fg_limit *syn_limit = &cfg->syn;
+	struct fg_lpm_key lk = { .prefixlen = 128 };
+	__builtin_memcpy(lk.addr, key.addr, sizeof(lk.addr));
+	if (bpf_map_lookup_elem(&allowlist, &lk)) {
+		ip_limit = &cfg->trusted_ip;
+		syn_limit = &cfg->trusted_syn;
+	}
+
 	// 1. Per-source limits. Checked before the global cap so one noisy IP
 	//    is dropped without eating the node-wide budget of everyone else.
-	if (cfg->ip.interval_ns || (is_syn && cfg->syn.interval_ns)) {
+	if (ip_limit->interval_ns || (is_syn && syn_limit->interval_ns)) {
 		struct fg_ip_state *st = bpf_map_lookup_elem(&ip_state, &key);
 		if (!st) {
 			// First packet from this IP: start with a full bucket.
@@ -238,11 +270,11 @@ int xdp_floodgate(struct xdp_md *ctx)
 			st = bpf_map_lookup_elem(&ip_state, &key);
 		}
 		if (st) {
-			if (is_syn && cfg->syn.interval_ns &&
-			    !gcra_allow(&st->syn_tat, now, &cfg->syn))
+			if (is_syn && syn_limit->interval_ns &&
+			    !gcra_allow(&st->syn_tat, now, syn_limit))
 				return verdict(FG_STAT_DROP_SYN, bytes);
-			if (cfg->ip.interval_ns &&
-			    !gcra_allow(&st->tat, now, &cfg->ip))
+			if (ip_limit->interval_ns &&
+			    !gcra_allow(&st->tat, now, ip_limit))
 				return verdict(FG_STAT_DROP_IP, bytes);
 		}
 	}

@@ -10,15 +10,17 @@
 //   - a crashing control plane never removes protection.
 package loader
 
-//go:generate go tool bpf2go -cc clang -target bpfel -type fg_config -type fg_datarec floodgate ../../bpf/floodgate.c
+//go:generate go tool bpf2go -cc clang -target bpfel -type fg_config -type fg_datarec -type fg_lpm_key floodgate ../../bpf/floodgate.c
 
 import (
 	"errors"
 	"fmt"
 	"net"
+	"net/netip"
 	"os"
 	"path/filepath"
 	"runtime"
+	"sort"
 
 	"github.com/cilium/ebpf"
 	"github.com/cilium/ebpf/link"
@@ -34,9 +36,11 @@ var linkPin = filepath.Join(PinDir, "xdp_link")
 type Limit struct{ Rate, Burst uint64 }
 
 type Limits struct {
-	IP     Limit // all packets per source IP
-	SYN    Limit // TCP SYNs per source IP
-	Global Limit // all packets for the whole node
+	IP         Limit // all packets per source IP
+	SYN        Limit // TCP SYNs per source IP
+	TrustedIP  Limit // same, for allowlisted sources
+	TrustedSYN Limit // same, for allowlisted sources
+	Global     Limit // all packets for the whole node
 }
 
 // StatNames matches the order of enum fg_stat in bpf/floodgate.c.
@@ -145,9 +149,11 @@ func GetLimits() (Limits, error) {
 		return Limits{}, err
 	}
 	return Limits{
-		IP:     Limit{c.Ip.Rate, c.Ip.Burst},
-		SYN:    Limit{c.Syn.Rate, c.Syn.Burst},
-		Global: Limit{c.Global.Rate, c.Global.Burst},
+		IP:         Limit{c.Ip.Rate, c.Ip.Burst},
+		SYN:        Limit{c.Syn.Rate, c.Syn.Burst},
+		TrustedIP:  Limit{c.TrustedIp.Rate, c.TrustedIp.Burst},
+		TrustedSYN: Limit{c.TrustedSyn.Rate, c.TrustedSyn.Burst},
+		Global:     Limit{c.Global.Rate, c.Global.Burst},
 	}, nil
 }
 
@@ -160,6 +166,107 @@ func SetLimits(lim Limits) error {
 	}
 	defer m.Close()
 	return m.Put(uint32(0), toConfig(lim))
+}
+
+// Allow adds an IP or CIDR to the trusted allowlist. Allowlisted sources
+// use Limits.TrustedIP / Limits.TrustedSYN instead of the default class.
+func Allow(cidr string) error {
+	k, err := allowKey(cidr)
+	if err != nil {
+		return err
+	}
+	m, err := openPinned("allowlist")
+	if err != nil {
+		return err
+	}
+	defer m.Close()
+	return m.Put(&k, uint8(1))
+}
+
+// Disallow removes an entry added by Allow.
+func Disallow(cidr string) error {
+	k, err := allowKey(cidr)
+	if err != nil {
+		return err
+	}
+	m, err := openPinned("allowlist")
+	if err != nil {
+		return err
+	}
+	defer m.Close()
+	return m.Delete(&k)
+}
+
+// Allowlist returns the trusted entries as canonical CIDRs, sorted.
+func Allowlist() ([]string, error) {
+	m, err := openPinned("allowlist")
+	if err != nil {
+		return nil, err
+	}
+	defer m.Close()
+
+	var out []string
+	var k floodgateFgLpmKey
+	var v uint8
+	it := m.Iterate()
+	for it.Next(&k, &v) {
+		out = append(out, allowString(k))
+	}
+	if err := it.Err(); err != nil {
+		return nil, err
+	}
+	sort.Strings(out)
+	return out, nil
+}
+
+// allowKey builds the LPM key for an IP or CIDR. IPv4 prefixes are stored
+// as IPv4-mapped IPv6 (::ffff:a.b.c.d), matching the packet-path key.
+func allowKey(s string) (floodgateFgLpmKey, error) {
+	var k floodgateFgLpmKey
+	p, err := netip.ParsePrefix(s)
+	if err != nil {
+		a, aerr := netip.ParseAddr(s)
+		if aerr != nil || a.Zone() != "" {
+			return k, fmt.Errorf("invalid IP or CIDR %q", s)
+		}
+		p = netip.PrefixFrom(a, a.BitLen())
+	}
+	if !p.IsValid() {
+		return k, fmt.Errorf("invalid IP or CIDR %q", s)
+	}
+	p = p.Masked()
+	addr, bits := p.Addr(), p.Bits()
+	if addr.Zone() != "" {
+		return k, fmt.Errorf("zones are not supported: %q", s)
+	}
+	if addr.Is4In6() {
+		addr = addr.Unmap()
+		bits -= 96
+	}
+	if addr.Is4() {
+		bits += 96
+	}
+	b := addr.As16()
+	k.Prefixlen = uint32(bits)
+	copy(k.Addr[:], b[:])
+	return k, nil
+}
+
+func allowString(k floodgateFgLpmKey) string {
+	addr, bits := netip.AddrFrom16(k.Addr), int(k.Prefixlen)
+	if addr.Is4In6() && bits >= 96 {
+		addr = addr.Unmap()
+		bits -= 96
+	}
+	return netip.PrefixFrom(addr, bits).String()
+}
+
+func openPinned(name string) (*ebpf.Map, error) {
+	m, err := ebpf.LoadPinnedMap(filepath.Join(PinDir, name), nil)
+	if err != nil {
+		return nil, fmt.Errorf("%s (is floodgate started?): %w", name, err)
+	}
+	return m, nil
 }
 
 // Stats sums the per-CPU counters.
@@ -193,6 +300,10 @@ func toConfig(l Limits) floodgateFgConfig {
 	c.Ip.IntervalNs, c.Ip.ToleranceNs = limiter.GCRA(l.IP.Rate, l.IP.Burst, 1)
 	c.Syn.Rate, c.Syn.Burst = l.SYN.Rate, l.SYN.Burst
 	c.Syn.IntervalNs, c.Syn.ToleranceNs = limiter.GCRA(l.SYN.Rate, l.SYN.Burst, 1)
+	c.TrustedIp.Rate, c.TrustedIp.Burst = l.TrustedIP.Rate, l.TrustedIP.Burst
+	c.TrustedIp.IntervalNs, c.TrustedIp.ToleranceNs = limiter.GCRA(l.TrustedIP.Rate, l.TrustedIP.Burst, 1)
+	c.TrustedSyn.Rate, c.TrustedSyn.Burst = l.TrustedSYN.Rate, l.TrustedSYN.Burst
+	c.TrustedSyn.IntervalNs, c.TrustedSyn.ToleranceNs = limiter.GCRA(l.TrustedSYN.Rate, l.TrustedSYN.Burst, 1)
 	c.Global.Rate, c.Global.Burst = l.Global.Rate, l.Global.Burst
 	// ponytail: splits evenly over all CPUs; if RSS steers traffic to only a
 	// few RX queues, the effective cap is lower. Shard by RX-queue count then.

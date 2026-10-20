@@ -119,7 +119,7 @@ dropped without using up the node budget everyone else shares.
 | **Global cap split per CPU** (`rate / NumCPU`) | If RSS sends traffic to only a few RX queues, the effective cap is lower than configured. | Contention-free. Shard by RX-queue count if it matters (marked `ponytail:` in `loader.go`). |
 | **LRU map, 2M entries** | ~100 B/entry kernel-side, so **~200 MB at 2M**. When >2M sources are active, the oldest are evicted and restart with a full bucket. | `-max-ips` controls it. 500k ≈ 50 MB is plenty for most nodes behind a Maglev LB, which spreads clients across the fleet. |
 | **Spoofed-source floods** | Random source IPs each look "new", so the per-IP limit never triggers and the LRU churns. | The global PPS cap is the backstop for this case. The kernel's `net.ipv4.tcp_syncookies=1` handles SYN state exhaustion. XDP SYN-cookies are possible later. |
-| **Generous default per-IP limit** (1000 pps) | A single attacking IP gets 1000 pps. | Carrier-grade NAT can put hundreds of real users behind one IP. The allowlist and priority classes (phase 2) let this be tightened safely. |
+| **Generous default per-IP limit** (1000 pps) | A single attacking IP gets 1000 pps. | Carrier-grade NAT can put hundreds of real users behind one IP. The allowlist and trusted class (phase 2) let this be tightened safely. |
 | **No IPv6 extension-header walk** | IPv6 SYNs behind extension headers aren't SYN-limited (they're still per-IP limited). | Rare in practice. Bounded-loop parsing if needed. |
 | **No IPIP/GUE decapsulation** | Behind **Katran**, packets arrive IPIP-encapsulated, so the XDP program would see Katran's IP, not the client's. | Cloud L4 LBs (NLB etc.) preserve client IPs. Inner-header parsing gets added with the Katran deploy work. |
 

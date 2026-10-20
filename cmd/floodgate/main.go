@@ -18,7 +18,7 @@ import (
 	"github.com/wasvaibhav/xdp-floodgate/internal/loader"
 )
 
-const usage = `usage: floodgate <start|stop|status|set-limit> [flags]
+const usage = `usage: floodgate <start|stop|status|set-limit|allow|deny|allowlist> [flags]
 run "floodgate <command> -h" for flags`
 
 func main() {
@@ -36,6 +36,12 @@ func main() {
 		err = status()
 	case "set-limit":
 		err = setLimit(args)
+	case "allow":
+		err = allow(args)
+	case "deny":
+		err = deny(args)
+	case "allowlist":
+		err = listAllowlist()
 	default:
 		fmt.Fprintln(os.Stderr, usage)
 		os.Exit(2)
@@ -52,6 +58,10 @@ func limitFlags(fs *flag.FlagSet, cur *loader.Limits) {
 	fs.Uint64Var(&cur.IP.Burst, "ip-burst", cur.IP.Burst, "burst per source IP, packets")
 	fs.Uint64Var(&cur.SYN.Rate, "syn-rate", cur.SYN.Rate, "TCP SYNs/sec per source IP (0 = off)")
 	fs.Uint64Var(&cur.SYN.Burst, "syn-burst", cur.SYN.Burst, "SYN burst per source IP")
+	fs.Uint64Var(&cur.TrustedIP.Rate, "trusted-ip-rate", cur.TrustedIP.Rate, "packets/sec per allowlisted source IP (0 = off)")
+	fs.Uint64Var(&cur.TrustedIP.Burst, "trusted-ip-burst", cur.TrustedIP.Burst, "burst per allowlisted source IP")
+	fs.Uint64Var(&cur.TrustedSYN.Rate, "trusted-syn-rate", cur.TrustedSYN.Rate, "TCP SYNs/sec per allowlisted source IP (0 = off)")
+	fs.Uint64Var(&cur.TrustedSYN.Burst, "trusted-syn-burst", cur.TrustedSYN.Burst, "SYN burst per allowlisted source IP")
 	fs.Uint64Var(&cur.Global.Rate, "global-pps", cur.Global.Rate, "packets/sec for the whole node (0 = off)")
 	fs.Uint64Var(&cur.Global.Burst, "global-burst", cur.Global.Burst, "node-wide burst, packets")
 }
@@ -108,7 +118,13 @@ func status() error {
 	for _, l := range []struct {
 		name string
 		loader.Limit
-	}{{"per-ip", lim.IP}, {"syn", lim.SYN}, {"global", lim.Global}} {
+	}{
+		{"per-ip", lim.IP},
+		{"syn", lim.SYN},
+		{"trusted-ip", lim.TrustedIP},
+		{"trusted-syn", lim.TrustedSYN},
+		{"global", lim.Global},
+	} {
 		fmt.Fprintf(w, "%s\t%s\t%d\n", l.name, rate(l.Rate), l.Burst)
 	}
 	fmt.Fprintln(w, "\nVERDICT\tPACKETS\tBYTES")
@@ -123,4 +139,33 @@ func rate(r uint64) string {
 		return "off"
 	}
 	return fmt.Sprint(r)
+}
+
+func allow(args []string) error {
+	if len(args) != 1 {
+		return fmt.Errorf("usage: floodgate allow <ip|cidr>")
+	}
+	if err := loader.Allow(args[0]); err != nil {
+		return err
+	}
+	fmt.Printf("allowlisted %s\n", args[0])
+	return nil
+}
+
+func deny(args []string) error {
+	if len(args) != 1 {
+		return fmt.Errorf("usage: floodgate deny <ip|cidr>")
+	}
+	return loader.Disallow(args[0])
+}
+
+func listAllowlist() error {
+	entries, err := loader.Allowlist()
+	if err != nil {
+		return err
+	}
+	for _, e := range entries {
+		fmt.Println(e)
+	}
+	return nil
 }
