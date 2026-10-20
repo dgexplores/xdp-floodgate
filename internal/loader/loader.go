@@ -47,17 +47,34 @@ type Counter struct{ Packets, Bytes uint64 }
 // Start loads the program, writes the initial limits, attaches to iface
 // and pins everything. generic forces the slower skb-mode XDP, needed on
 // NICs/veths without native XDP support.
-func Start(iface string, maxIPs uint32, generic bool, lim Limits) error {
-	if _, err := os.Stat(linkPin); err == nil {
+func Start(iface string, maxIPs uint32, generic bool, lim Limits) (err error) {
+	if maxIPs == 0 {
+		return errors.New("max-ips must be greater than 0")
+	}
+	if _, statErr := os.Stat(linkPin); statErr == nil {
 		return errors.New("already attached (run `floodgate stop` first)")
+	} else if !errors.Is(statErr, os.ErrNotExist) {
+		return statErr
 	}
 	ifc, err := net.InterfaceByName(iface)
 	if err != nil {
 		return err
 	}
+	// No link pin means nothing is attached. Remove pins left behind by a
+	// start that failed after creating its maps, so this attempt gets fresh
+	// state and the requested max_entries.
+	if err := os.RemoveAll(PinDir); err != nil {
+		return err
+	}
 	if err := os.MkdirAll(PinDir, 0o700); err != nil {
 		return fmt.Errorf("%w (is bpffs mounted at /sys/fs/bpf?)", err)
 	}
+	defer func() {
+		if err != nil {
+			// Best effort: never leave half-attached state behind.
+			err = errors.Join(err, os.RemoveAll(PinDir))
+		}
+	}()
 
 	spec, err := loadFloodgate()
 	if err != nil {
@@ -101,10 +118,17 @@ func Start(iface string, maxIPs uint32, generic bool, lim Limits) error {
 func Stop() error {
 	l, err := link.LoadPinnedLink(linkPin, nil)
 	if err == nil {
-		// Removing the last reference to the link detaches the program.
-		err = errors.Join(l.Unpin(), l.Close())
+		// Keep the pin if detaching fails, so a retry can still find the link.
+		if err := l.Unpin(); err != nil {
+			_ = l.Close()
+			return err
+		}
+		err = l.Close()
 	} else if errors.Is(err, os.ErrNotExist) {
 		err = nil
+	} else {
+		// A corrupt pin cannot be detached; clear the directory anyway.
+		return errors.Join(err, os.RemoveAll(PinDir))
 	}
 	return errors.Join(err, os.RemoveAll(PinDir))
 }
