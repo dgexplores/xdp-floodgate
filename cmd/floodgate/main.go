@@ -11,6 +11,7 @@ package main
 import (
 	"flag"
 	"fmt"
+	"math"
 	"os"
 	"text/tabwriter"
 
@@ -64,12 +65,15 @@ func start(args []string) error {
 	}
 	fs := flag.NewFlagSet("start", flag.ExitOnError)
 	iface := fs.String("iface", "", "interface to protect (required)")
-	maxIPs := fs.Uint("max-ips", 2_000_000, "source IPs tracked; least recently seen evicted beyond this (~100 B each)")
+	maxIPs := fs.Uint64("max-ips", 2_000_000, "source IPs tracked; least recently seen evicted beyond this (~100 B each)")
 	generic := fs.Bool("generic", false, "force generic (skb) XDP mode, for NICs/veths without native XDP")
 	limitFlags(fs, &lim)
 	fs.Parse(args)
 	if *iface == "" {
 		return fmt.Errorf("-iface is required")
+	}
+	if *maxIPs == 0 || *maxIPs > math.MaxUint32 {
+		return fmt.Errorf("-max-ips must be between 1 and %d", uint64(math.MaxUint32))
 	}
 	if err := loader.Start(*iface, uint32(*maxIPs), *generic, lim); err != nil {
 		return err
