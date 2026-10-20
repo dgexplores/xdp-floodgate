@@ -33,9 +33,11 @@ the last known policy when any userspace component dies.
 ## Phase 5 — fleet coordination
 
 - Pull-based agent: `floodgate agent -source <url|file> -token <secret>`.
-- A policy bundle carries limits and allowlist entries. The agent applies
-  it atomically and only after validation; on fetch or validation errors
-  it keeps the last known-good policy and reports the failure.
+- A policy bundle carries limits and allowlist entries. The agent
+  validates the whole bundle before touching any map, then applies a
+  converging diff; on fetch, parse or validation errors it keeps the last
+  known-good policy and reports the failure. No invalid bundle is ever
+  partially applied.
 - Token authenticated; TLS is handled by the URL (`https://`).
 - No consensus, gossip or database: the source of truth is a file or an
   HTTP endpoint managed by existing orchestration (Ansible, Kubernetes,

@@ -15,6 +15,7 @@ package loader
 import (
 	"errors"
 	"fmt"
+	"math"
 	"net"
 	"net/netip"
 	"os"
@@ -47,6 +48,42 @@ type Limits struct {
 	Global     Limit `json:"global"`      // all packets for the whole node
 }
 
+// ValidateLimits checks that the derived GCRA fields fit in uint64, so a
+// huge burst cannot silently wrap and disable a limit.
+func ValidateLimits(l Limits) error {
+	for _, c := range []struct {
+		name   string
+		lim    Limit
+		shards int
+	}{
+		{"ip", l.IP, 1},
+		{"syn", l.SYN, 1},
+		{"trusted_ip", l.TrustedIP, 1},
+		{"trusted_syn", l.TrustedSYN, 1},
+		{"global", l.Global, runtime.NumCPU()},
+	} {
+		if c.lim.Rate == 0 {
+			continue
+		}
+		n := uint64(c.shards)
+		if n < 1 {
+			n = 1
+		}
+		interval := uint64(1e9) * n / c.lim.Rate
+		if interval == 0 {
+			interval = 1
+		}
+		burst := c.lim.Burst / n
+		if burst < 1 {
+			burst = 1
+		}
+		if burst > math.MaxUint64/interval {
+			return fmt.Errorf("%s: burst %d is too large for rate %d", c.name, c.lim.Burst, c.lim.Rate)
+		}
+	}
+	return nil
+}
+
 // StatNames matches the order of enum fg_stat in bpf/floodgate.c.
 var StatNames = []string{"pass", "drop_ip", "drop_syn", "drop_global", "not_ip"}
 
@@ -58,6 +95,9 @@ type Counter struct{ Packets, Bytes uint64 }
 func Start(iface string, maxIPs uint32, generic bool, lim Limits) (err error) {
 	if maxIPs == 0 {
 		return errors.New("max-ips must be greater than 0")
+	}
+	if err := ValidateLimits(lim); err != nil {
+		return err
 	}
 	if _, statErr := os.Stat(linkPin); statErr == nil {
 		return errors.New("already attached (run `floodgate stop` first)")
@@ -167,6 +207,9 @@ func GetLimits() (Limits, error) {
 // SetLimits replaces the live limits. The XDP program sees the new values
 // on its very next packet; no reload, no dropped connections.
 func SetLimits(lim Limits) error {
+	if err := ValidateLimits(lim); err != nil {
+		return err
+	}
 	m, err := ebpf.LoadPinnedMap(filepath.Join(PinDir, "config"), nil)
 	if err != nil {
 		return err
@@ -262,8 +305,18 @@ func Allowlist() ([]string, error) {
 // ValidateCIDR reports whether s is an IP or CIDR the allowlist accepts,
 // without touching the pinned map.
 func ValidateCIDR(s string) error {
-	_, err := allowKey(s)
+	_, err := CanonicalCIDR(s)
 	return err
+}
+
+// CanonicalCIDR returns the form stored in the allowlist. IPv4 entries
+// come back as IPv4-mapped prefixes, so callers can compare entries.
+func CanonicalCIDR(s string) (string, error) {
+	k, err := allowKey(s)
+	if err != nil {
+		return "", err
+	}
+	return allowString(k), nil
 }
 
 // allowKey builds the LPM key for an IP or CIDR. IPv4 prefixes are stored

@@ -18,13 +18,15 @@ import (
 	"os/signal"
 	"syscall"
 	"text/tabwriter"
+	"time"
 
+	"github.com/wasvaibhav/xdp-floodgate/internal/agent"
 	"github.com/wasvaibhav/xdp-floodgate/internal/control"
 	"github.com/wasvaibhav/xdp-floodgate/internal/loader"
 	"github.com/wasvaibhav/xdp-floodgate/internal/lockfile"
 )
 
-const usage = `usage: floodgate <start|stop|status|serve|set-limit|allow|deny|allowlist> [flags]
+const usage = `usage: floodgate <start|stop|status|serve|agent|set-limit|allow|deny|allowlist> [flags]
 run "floodgate <command> -h" for flags`
 
 func main() {
@@ -42,6 +44,8 @@ func main() {
 		err = status(args)
 	case "serve":
 		err = serve(args)
+	case "agent":
+		err = agentCmd(args)
 	case "set-limit":
 		err = setLimit(args)
 	case "allow":
@@ -123,6 +127,28 @@ func serve(args []string) error {
 	defer stop()
 	fmt.Fprintf(os.Stderr, "floodgate: serving on %s\n", *socket)
 	return control.Serve(ctx, *socket)
+}
+
+func agentCmd(args []string) error {
+	fs := flag.NewFlagSet("agent", flag.ExitOnError)
+	source := fs.String("source", "", "bundle URL (http/https) or file path (required)")
+	token := fs.String("token", os.Getenv("FLOODGATE_TOKEN"), "bearer token for HTTP sources (default $FLOODGATE_TOKEN)")
+	interval := fs.Duration("interval", 30*time.Second, "poll interval")
+	once := fs.Bool("once", false, "apply one bundle and exit")
+	fs.Parse(args)
+	if *source == "" {
+		return fmt.Errorf("-source is required")
+	}
+	if _, err := loader.ReadSnapshot(); err != nil {
+		return fmt.Errorf("not running? %w", err)
+	}
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
+	a := agent.New(*source, *token, *interval)
+	if *once {
+		return a.Once(ctx)
+	}
+	return a.Run(ctx)
 }
 
 func status(args []string) error {

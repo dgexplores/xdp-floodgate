@@ -162,6 +162,10 @@ func (s *Server) putLimits(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, err)
 		return
 	}
+	if err := loader.ValidateLimits(lim); err != nil {
+		writeError(w, http.StatusBadRequest, err)
+		return
+	}
 	if err := lockfile.Do(s.LockPath, func() error { return s.SetLimits(lim) }); err != nil {
 		writeError(w, http.StatusInternalServerError, err)
 		return

@@ -120,6 +120,19 @@ func TestPutLimits(t *testing.T) {
 	}
 }
 
+func TestPutLimitsRejectsOverflow(t *testing.T) {
+	f := newFake()
+	h := newServer(t, f)
+	rec := get(t, h, "PUT", "/v1/limits",
+		`{"ip":{"rate":1,"burst":18446744073709551615}}`)
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d, want 400", rec.Code)
+	}
+	if got, _ := f.Snapshot(); got.Limits.IP.Rate != 1000 {
+		t.Fatalf("limits changed: %+v", got.Limits)
+	}
+}
+
 func TestPutLimitsRejectsUnknownField(t *testing.T) {
 	f := newFake()
 	h := newServer(t, f)
