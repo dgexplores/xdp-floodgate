@@ -13,7 +13,7 @@ import (
 )
 
 func TestStartRejectsZeroMaxIPs(t *testing.T) {
-	if err := Start("lo", 0, true, Limits{}); err == nil {
+	if err := Start("lo", 0, true, false, Limits{}); err == nil {
 		t.Fatal("Start accepted max-ips 0")
 	}
 }
@@ -26,7 +26,7 @@ func TestLifecycle(t *testing.T) {
 		t.Skipf("%s already in use", PinDir)
 	}
 	lim := Limits{IP: Limit{Rate: 100, Burst: 10}, SYN: Limit{Rate: 10, Burst: 5}}
-	if err := Start("lo", 1024, true, lim); err != nil {
+	if err := Start("lo", 1024, true, true, lim); err != nil {
 		if strings.Contains(err.Error(), "bpffs") {
 			t.Skipf("bpffs not mounted: %v", err)
 		}
@@ -34,7 +34,7 @@ func TestLifecycle(t *testing.T) {
 	}
 	t.Cleanup(func() { _ = Stop() })
 
-	if err := Start("lo", 1024, true, lim); err == nil || !strings.Contains(err.Error(), "already attached") {
+	if err := Start("lo", 1024, true, true, lim); err == nil || !strings.Contains(err.Error(), "already attached") {
 		t.Errorf("second start error = %v, want already attached", err)
 	}
 
@@ -44,6 +44,9 @@ func TestLifecycle(t *testing.T) {
 	}
 	if got != lim {
 		t.Errorf("limits = %+v, want %+v", got, lim)
+	}
+	if decap, err := Decap(); err != nil || !decap {
+		t.Errorf("Decap() = %v, %v; want true", decap, err)
 	}
 
 	lim.IP.Rate = 7
@@ -63,6 +66,30 @@ func TestLifecycle(t *testing.T) {
 	}
 	if len(stats) != len(StatNames) {
 		t.Errorf("stats has %d counters, want %d", len(stats), len(StatNames))
+	}
+
+	// The allowlist lives in a pinned map and survives CLI invocations.
+	for _, cidr := range []string{"192.0.2.0/24", "2001:db8::/32"} {
+		if err := Allow(cidr); err != nil {
+			t.Fatalf("allow %s: %v", cidr, err)
+		}
+	}
+	entries, err := Allowlist()
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := []string{"192.0.2.0/24", "2001:db8::/32"}
+	if len(entries) != len(want) || entries[0] != want[0] || entries[1] != want[1] {
+		t.Errorf("allowlist = %v, want %v", entries, want)
+	}
+	if err := Disallow("192.0.2.0/24"); err != nil {
+		t.Fatal(err)
+	}
+	if entries, err = Allowlist(); err != nil {
+		t.Fatal(err)
+	}
+	if len(entries) != 1 || entries[0] != want[1] {
+		t.Errorf("allowlist after remove = %v, want [%s]", entries, want[1])
 	}
 
 	if err := Stop(); err != nil {
