@@ -96,6 +96,17 @@ struct {
 	__uint(pinning, LIBBPF_PIN_BY_NAME);
 } config SEC(".maps");
 
+// Last successful policy write, nanoseconds since the Unix epoch. The
+// data plane never reads it; userspace exposes it so operators can alert
+// on stale policy after a failed rollout.
+struct {
+	__uint(type, BPF_MAP_TYPE_ARRAY);
+	__uint(max_entries, 1);
+	__type(key, __u32);
+	__type(value, __u64);
+	__uint(pinning, LIBBPF_PIN_BY_NAME);
+} applied SEC(".maps");
+
 // Per-source-IP state. LRU: when full, the least recently seen IP is
 // evicted automatically, so memory is bounded no matter how many sources
 // show up. max_entries is overridden by the loader (--max-ips).

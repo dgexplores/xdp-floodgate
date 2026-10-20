@@ -21,6 +21,7 @@ import (
 	"path/filepath"
 	"runtime"
 	"sort"
+	"time"
 
 	"github.com/cilium/ebpf"
 	"github.com/cilium/ebpf/link"
@@ -33,14 +34,17 @@ const PinDir = "/sys/fs/bpf/floodgate"
 var linkPin = filepath.Join(PinDir, "xdp_link")
 
 // Limit is one rate limit in human units. Rate 0 = unlimited.
-type Limit struct{ Rate, Burst uint64 }
+type Limit struct {
+	Rate  uint64 `json:"rate"`
+	Burst uint64 `json:"burst"`
+}
 
 type Limits struct {
-	IP         Limit // all packets per source IP
-	SYN        Limit // TCP SYNs per source IP
-	TrustedIP  Limit // same, for allowlisted sources
-	TrustedSYN Limit // same, for allowlisted sources
-	Global     Limit // all packets for the whole node
+	IP         Limit `json:"ip"`          // all packets per source IP
+	SYN        Limit `json:"syn"`         // TCP SYNs per source IP
+	TrustedIP  Limit `json:"trusted_ip"`  // same, for allowlisted sources
+	TrustedSYN Limit `json:"trusted_syn"` // same, for allowlisted sources
+	Global     Limit `json:"global"`      // all packets for the whole node
 }
 
 // StatNames matches the order of enum fg_stat in bpf/floodgate.c.
@@ -99,6 +103,9 @@ func Start(iface string, maxIPs uint32, generic bool, lim Limits) (err error) {
 	defer objs.Close()
 
 	if err := objs.Config.Put(uint32(0), toConfig(lim)); err != nil {
+		return err
+	}
+	if err := markApplied(); err != nil {
 		return err
 	}
 
@@ -165,7 +172,34 @@ func SetLimits(lim Limits) error {
 		return err
 	}
 	defer m.Close()
-	return m.Put(uint32(0), toConfig(lim))
+	if err := m.Put(uint32(0), toConfig(lim)); err != nil {
+		return err
+	}
+	return markApplied()
+}
+
+// Applied reports when the policy was last changed. The data plane keeps
+// enforcing it regardless of whether the control daemon is alive.
+func Applied() (time.Time, error) {
+	m, err := openPinned("applied")
+	if err != nil {
+		return time.Time{}, err
+	}
+	defer m.Close()
+	var ns uint64
+	if err := m.Lookup(uint32(0), &ns); err != nil {
+		return time.Time{}, err
+	}
+	return time.Unix(0, int64(ns)), nil
+}
+
+func markApplied() error {
+	m, err := openPinned("applied")
+	if err != nil {
+		return err
+	}
+	defer m.Close()
+	return m.Put(uint32(0), uint64(time.Now().UnixNano()))
 }
 
 // Allow adds an IP or CIDR to the trusted allowlist. Allowlisted sources
@@ -180,7 +214,10 @@ func Allow(cidr string) error {
 		return err
 	}
 	defer m.Close()
-	return m.Put(&k, uint8(1))
+	if err := m.Put(&k, uint8(1)); err != nil {
+		return err
+	}
+	return markApplied()
 }
 
 // Disallow removes an entry added by Allow.
@@ -194,7 +231,10 @@ func Disallow(cidr string) error {
 		return err
 	}
 	defer m.Close()
-	return m.Delete(&k)
+	if err := m.Delete(&k); err != nil {
+		return err
+	}
+	return markApplied()
 }
 
 // Allowlist returns the trusted entries as canonical CIDRs, sorted.
@@ -205,7 +245,7 @@ func Allowlist() ([]string, error) {
 	}
 	defer m.Close()
 
-	var out []string
+	out := []string{}
 	var k floodgateFgLpmKey
 	var v uint8
 	it := m.Iterate()
@@ -217,6 +257,13 @@ func Allowlist() ([]string, error) {
 	}
 	sort.Strings(out)
 	return out, nil
+}
+
+// ValidateCIDR reports whether s is an IP or CIDR the allowlist accepts,
+// without touching the pinned map.
+func ValidateCIDR(s string) error {
+	_, err := allowKey(s)
+	return err
 }
 
 // allowKey builds the LPM key for an IP or CIDR. IPv4 prefixes are stored
@@ -290,6 +337,47 @@ func readStats(m *ebpf.Map) ([]Counter, error) {
 			out[i].Packets += r.Packets
 			out[i].Bytes += r.Bytes
 		}
+	}
+	return out, nil
+}
+
+// Stat is one verdict counter with its name.
+type Stat struct {
+	Verdict string `json:"verdict"`
+	Packets uint64 `json:"packets"`
+	Bytes   uint64 `json:"bytes"`
+}
+
+// Snapshot is the live data-plane state served by status and the API.
+type Snapshot struct {
+	Limits    Limits    `json:"limits"`
+	Stats     []Stat    `json:"stats"`
+	Allowlist []string  `json:"allowlist"`
+	Applied   time.Time `json:"applied_at"`
+}
+
+// ReadSnapshot reads the limits, per-verdict counters and allowlist. It is
+// a point-in-time view: the maps may change while it is being assembled.
+func ReadSnapshot() (Snapshot, error) {
+	lim, err := GetLimits()
+	if err != nil {
+		return Snapshot{}, err
+	}
+	counters, err := Stats()
+	if err != nil {
+		return Snapshot{}, err
+	}
+	allow, err := Allowlist()
+	if err != nil {
+		return Snapshot{}, err
+	}
+	applied, err := Applied()
+	if err != nil {
+		return Snapshot{}, err
+	}
+	out := Snapshot{Limits: lim, Allowlist: allow, Applied: applied}
+	for i, c := range counters {
+		out.Stats = append(out.Stats, Stat{StatNames[i], c.Packets, c.Bytes})
 	}
 	return out, nil
 }

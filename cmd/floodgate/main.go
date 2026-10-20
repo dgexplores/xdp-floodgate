@@ -9,16 +9,22 @@
 package main
 
 import (
+	"context"
+	"encoding/json"
 	"flag"
 	"fmt"
 	"math"
 	"os"
+	"os/signal"
+	"syscall"
 	"text/tabwriter"
 
+	"github.com/wasvaibhav/xdp-floodgate/internal/control"
 	"github.com/wasvaibhav/xdp-floodgate/internal/loader"
+	"github.com/wasvaibhav/xdp-floodgate/internal/lockfile"
 )
 
-const usage = `usage: floodgate <start|stop|status|set-limit|allow|deny|allowlist> [flags]
+const usage = `usage: floodgate <start|stop|status|serve|set-limit|allow|deny|allowlist> [flags]
 run "floodgate <command> -h" for flags`
 
 func main() {
@@ -33,7 +39,9 @@ func main() {
 	case "stop":
 		err = loader.Stop()
 	case "status":
-		err = status()
+		err = status(args)
+	case "serve":
+		err = serve(args)
 	case "set-limit":
 		err = setLimit(args)
 	case "allow":
@@ -93,44 +101,64 @@ func start(args []string) error {
 }
 
 func setLimit(args []string) error {
-	// Start from the live values so unspecified flags stay unchanged.
-	lim, err := loader.GetLimits()
-	if err != nil {
-		return fmt.Errorf("reading limits (is floodgate started?): %w", err)
-	}
-	fs := flag.NewFlagSet("set-limit", flag.ExitOnError)
-	limitFlags(fs, &lim)
-	fs.Parse(args)
-	return loader.SetLimits(lim)
+	// Start from the live values so unspecified flags stay unchanged. The
+	// lock makes that read-modify-write atomic against the control daemon.
+	return lockfile.Do(control.DefaultLock, func() error {
+		lim, err := loader.GetLimits()
+		if err != nil {
+			return fmt.Errorf("reading limits (is floodgate started?): %w", err)
+		}
+		fs := flag.NewFlagSet("set-limit", flag.ExitOnError)
+		limitFlags(fs, &lim)
+		fs.Parse(args)
+		return loader.SetLimits(lim)
+	})
 }
 
-func status() error {
-	lim, err := loader.GetLimits()
+func serve(args []string) error {
+	fs := flag.NewFlagSet("serve", flag.ExitOnError)
+	socket := fs.String("socket", control.DefaultSocket, "Unix socket path")
+	fs.Parse(args)
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
+	fmt.Fprintf(os.Stderr, "floodgate: serving on %s\n", *socket)
+	return control.Serve(ctx, *socket)
+}
+
+func status(args []string) error {
+	fs := flag.NewFlagSet("status", flag.ExitOnError)
+	asJSON := fs.Bool("json", false, "print the full snapshot as JSON")
+	fs.Parse(args)
+
+	snap, err := loader.ReadSnapshot()
 	if err != nil {
 		return fmt.Errorf("not running? %w", err)
 	}
-	stats, err := loader.Stats()
-	if err != nil {
-		return err
+	if *asJSON {
+		enc := json.NewEncoder(os.Stdout)
+		enc.SetIndent("", "  ")
+		return enc.Encode(snap)
 	}
+
 	w := tabwriter.NewWriter(os.Stdout, 0, 0, 2, ' ', 0)
 	fmt.Fprintln(w, "LIMIT\tRATE/s\tBURST")
 	for _, l := range []struct {
 		name string
 		loader.Limit
 	}{
-		{"per-ip", lim.IP},
-		{"syn", lim.SYN},
-		{"trusted-ip", lim.TrustedIP},
-		{"trusted-syn", lim.TrustedSYN},
-		{"global", lim.Global},
+		{"per-ip", snap.Limits.IP},
+		{"syn", snap.Limits.SYN},
+		{"trusted-ip", snap.Limits.TrustedIP},
+		{"trusted-syn", snap.Limits.TrustedSYN},
+		{"global", snap.Limits.Global},
 	} {
 		fmt.Fprintf(w, "%s\t%s\t%d\n", l.name, rate(l.Rate), l.Burst)
 	}
 	fmt.Fprintln(w, "\nVERDICT\tPACKETS\tBYTES")
-	for i, c := range stats {
-		fmt.Fprintf(w, "%s\t%d\t%d\n", loader.StatNames[i], c.Packets, c.Bytes)
+	for _, st := range snap.Stats {
+		fmt.Fprintf(w, "%s\t%d\t%d\n", st.Verdict, st.Packets, st.Bytes)
 	}
+	fmt.Fprintf(w, "\nallowlist: %d entries\n", len(snap.Allowlist))
 	return w.Flush()
 }
 
