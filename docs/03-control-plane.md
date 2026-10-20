@@ -32,7 +32,7 @@ silently disable a limit. Bodies are capped at 1 MiB.
 | Method | Path | Purpose |
 | --- | --- | --- |
 | GET | `/healthz` | `200 ok` when the pinned maps are readable, `503` otherwise |
-| GET | `/v1/status` | Limits, verdict counters, allowlist, `applied_at` |
+| GET | `/v1/status` | Limits, verdict counters, allowlist, `applied_at`, `decap` |
 | PUT | `/v1/limits` | Replace all limits |
 | GET | `/v1/allowlist` | `{"allowlist":["192.0.2.0/24", ...]}` |
 | POST | `/v1/allowlist` | Add `{"cidr":"192.0.2.0/24"}` |
@@ -102,7 +102,8 @@ floodgate_policy_applied_timestamp_seconds 1700000000
   "limits": {"ip": {"rate": 1000, "burst": 2000}, "...": {}},
   "stats": [{"verdict": "pass", "packets": 10, "bytes": 640}],
   "allowlist": ["192.0.2.0/24"],
-  "applied_at": "2026-10-20T12:00:00Z"
+  "applied_at": "2026-10-20T12:00:00Z",
+  "decap": false
 }
 ```
 

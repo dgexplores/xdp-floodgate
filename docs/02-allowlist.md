@@ -33,6 +33,11 @@ An empty trusted limit (rate 0) means "no per-source limit" for
 allowlisted traffic, which is the default: `floodgate allow` is enough to
 exempt a health checker. Set `-trusted-ip-rate` and friends to cap it.
 
+With `-decap`, both the allowlist and the per-IP state use the inner
+source. Only enable it where IP-in-IP can arrive solely from a trusted
+load balancer: anyone who can send a tunnel can claim an allowlisted
+inner address. See [05-deployment.md](05-deployment.md).
+
 ## State sharing
 
 Per-IP GCRA state is keyed by source address only, not by class. Adding or

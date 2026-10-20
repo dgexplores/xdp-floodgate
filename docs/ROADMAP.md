@@ -5,6 +5,8 @@ limit, a node-wide PPS cap, per-CPU counters and a CLI. The phases below
 build outward from it. The order matters: the data plane keeps enforcing
 the last known policy when any userspace component dies.
 
+All six phases are implemented. This file is kept as the design record.
+
 ## Phase 2 — trust
 
 - Source allowlist stored in an LPM trie: IPv4 and IPv6 CIDRs.
@@ -46,6 +48,8 @@ the last known policy when any userspace component dies.
 ## Phase 6 — encapsulated traffic and deployment
 
 - Parse one level of IP-in-IP (IPv4 and IPv6), so clients behind Katran
-  are limited by their real source address.
+  are limited by their real source address. This is opt-in (`-decap`):
+  the inner source is trusted, so tunnels must be filtered at the edge.
 - systemd unit, install target and a container healthcheck.
 - Release artifacts built from the same commit as the image.
+- See [05-deployment.md](05-deployment.md).

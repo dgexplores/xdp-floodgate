@@ -48,6 +48,21 @@ type Limits struct {
 	Global     Limit `json:"global"`      // all packets for the whole node
 }
 
+// Decap reports whether the data plane was started with IP-in-IP
+// decapsulation enabled.
+func Decap() (bool, error) {
+	m, err := openPinned("settings")
+	if err != nil {
+		return false, err
+	}
+	defer m.Close()
+	var v uint32
+	if err := m.Lookup(uint32(0), &v); err != nil {
+		return false, err
+	}
+	return v != 0, nil
+}
+
 // ValidateLimits checks that the derived GCRA fields fit in uint64, so a
 // huge burst cannot silently wrap and disable a limit.
 func ValidateLimits(l Limits) error {
@@ -92,7 +107,7 @@ type Counter struct{ Packets, Bytes uint64 }
 // Start loads the program, writes the initial limits, attaches to iface
 // and pins everything. generic forces the slower skb-mode XDP, needed on
 // NICs/veths without native XDP support.
-func Start(iface string, maxIPs uint32, generic bool, lim Limits) (err error) {
+func Start(iface string, maxIPs uint32, generic bool, decap bool, lim Limits) (err error) {
 	if maxIPs == 0 {
 		return errors.New("max-ips must be greater than 0")
 	}
@@ -143,6 +158,13 @@ func Start(iface string, maxIPs uint32, generic bool, lim Limits) (err error) {
 	defer objs.Close()
 
 	if err := objs.Config.Put(uint32(0), toConfig(lim)); err != nil {
+		return err
+	}
+	var decapValue uint32
+	if decap {
+		decapValue = 1
+	}
+	if err := objs.Settings.Put(uint32(0), decapValue); err != nil {
 		return err
 	}
 	if err := markApplied(); err != nil {
@@ -407,6 +429,7 @@ type Snapshot struct {
 	Stats     []Stat    `json:"stats"`
 	Allowlist []string  `json:"allowlist"`
 	Applied   time.Time `json:"applied_at"`
+	Decap     bool      `json:"decap"`
 }
 
 // ReadSnapshot reads the limits, per-verdict counters and allowlist. It is
@@ -428,7 +451,11 @@ func ReadSnapshot() (Snapshot, error) {
 	if err != nil {
 		return Snapshot{}, err
 	}
-	out := Snapshot{Limits: lim, Allowlist: allow, Applied: applied}
+	decap, err := Decap()
+	if err != nil {
+		return Snapshot{}, err
+	}
+	out := Snapshot{Limits: lim, Allowlist: allow, Applied: applied, Decap: decap}
 	for i, c := range counters {
 		out.Stats = append(out.Stats, Stat{StatNames[i], c.Packets, c.Bytes})
 	}

@@ -89,6 +89,7 @@ func start(args []string) error {
 	iface := fs.String("iface", "", "interface to protect (required)")
 	maxIPs := fs.Uint64("max-ips", 2_000_000, "source IPs tracked; least recently seen evicted beyond this (~100 B each)")
 	generic := fs.Bool("generic", false, "force generic (skb) XDP mode, for NICs/veths without native XDP")
+	decap := fs.Bool("decap", false, "trust one level of IP-in-IP and limit the inner source")
 	limitFlags(fs, &lim)
 	fs.Parse(args)
 	if *iface == "" {
@@ -97,7 +98,7 @@ func start(args []string) error {
 	if *maxIPs == 0 || *maxIPs > math.MaxUint32 {
 		return fmt.Errorf("-max-ips must be between 1 and %d", uint64(math.MaxUint32))
 	}
-	if err := loader.Start(*iface, uint32(*maxIPs), *generic, lim); err != nil {
+	if err := loader.Start(*iface, uint32(*maxIPs), *generic, *decap, lim); err != nil {
 		return err
 	}
 	fmt.Printf("attached to %s, state pinned in %s\n", *iface, loader.PinDir)
@@ -185,6 +186,7 @@ func status(args []string) error {
 		fmt.Fprintf(w, "%s\t%d\t%d\n", st.Verdict, st.Packets, st.Bytes)
 	}
 	fmt.Fprintf(w, "\nallowlist: %d entries\n", len(snap.Allowlist))
+	fmt.Fprintf(w, "decap: %s\n", onOff(snap.Decap))
 	return w.Flush()
 }
 
@@ -193,6 +195,13 @@ func rate(r uint64) string {
 		return "off"
 	}
 	return fmt.Sprint(r)
+}
+
+func onOff(v bool) string {
+	if v {
+		return "on"
+	}
+	return "off"
 }
 
 func allow(args []string) error {

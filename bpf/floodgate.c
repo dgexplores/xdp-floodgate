@@ -107,6 +107,17 @@ struct {
 	__uint(pinning, LIBBPF_PIN_BY_NAME);
 } applied SEC(".maps");
 
+// Start-time settings that are not rate limits. Written once by the
+// loader; set-limit and the control API do not touch it.
+//   decap: 1 = parse one level of IP-in-IP and limit the inner source.
+struct {
+	__uint(type, BPF_MAP_TYPE_ARRAY);
+	__uint(max_entries, 1);
+	__type(key, __u32);
+	__type(value, __u32);
+	__uint(pinning, LIBBPF_PIN_BY_NAME);
+} settings SEC(".maps");
+
 // Per-source-IP state. LRU: when full, the least recently seen IP is
 // evicted automatically, so memory is bounded no matter how many sources
 // show up. max_entries is overridden by the loader (--max-ips).
@@ -195,6 +206,39 @@ static __always_inline int verdict(__u32 stat, __u64 bytes)
 	return stat == FG_STAT_PASS || stat == FG_STAT_NOT_IP ? XDP_PASS : XDP_DROP;
 }
 
+// Parse an inner IPv4 or IPv6 header at l3 and fill key/tcp. Returns 0 if
+// the inner header is malformed or of another family; the caller then
+// keeps the outer source, so a truncated tunnel cannot bypass the limit.
+static __always_inline int parse_inner(void *l3, __be16 proto, void *data_end,
+				       struct fg_ip_key *key,
+				       struct tcphdr **tcp)
+{
+	*tcp = NULL;
+	if (proto == bpf_htons(ETH_P_IP)) {
+		struct iphdr *iph = l3;
+
+		if ((void *)(iph + 1) > data_end || iph->ihl < 5)
+			return 0;
+		key->addr[2] = bpf_htonl(0xffff);
+		key->addr[3] = iph->saddr;
+		if (iph->protocol == IPPROTO_TCP &&
+		    !(iph->frag_off & bpf_htons(0x1fff)))
+			*tcp = (void *)iph + iph->ihl * 4;
+		return 1;
+	}
+	if (proto == bpf_htons(ETH_P_IPV6)) {
+		struct ipv6hdr *ip6 = l3;
+
+		if ((void *)(ip6 + 1) > data_end)
+			return 0;
+		__builtin_memcpy(key->addr, &ip6->saddr, sizeof(key->addr));
+		if (ip6->nexthdr == IPPROTO_TCP)
+			*tcp = (void *)(ip6 + 1);
+		return 1;
+	}
+	return 0;
+}
+
 // ---- program --------------------------------------------------------------
 
 SEC("xdp")
@@ -225,6 +269,8 @@ int xdp_floodgate(struct xdp_md *ctx)
 
 	struct fg_ip_key key = {};
 	struct tcphdr *tcp = NULL;
+	void *inner = NULL;
+	__be16 inner_proto = 0;
 
 	if (proto == bpf_htons(ETH_P_IP)) {
 		struct iphdr *iph = l3;
@@ -236,6 +282,16 @@ int xdp_floodgate(struct xdp_md *ctx)
 		if (iph->protocol == IPPROTO_TCP &&
 		    !(iph->frag_off & bpf_htons(0x1fff)))
 			tcp = (void *)iph + iph->ihl * 4;
+		// One level of IP-in-IP; fragmented outer packets are not
+		// decapsulated because the inner header may be incomplete.
+		if ((iph->protocol == IPPROTO_IPIP ||
+		     iph->protocol == IPPROTO_IPV6) &&
+		    !(iph->frag_off & bpf_htons(0x3fff))) {
+			inner = (void *)iph + iph->ihl * 4;
+			inner_proto = iph->protocol == IPPROTO_IPIP
+					      ? bpf_htons(ETH_P_IP)
+					      : bpf_htons(ETH_P_IPV6);
+		}
 	} else if (proto == bpf_htons(ETH_P_IPV6)) {
 		struct ipv6hdr *ip6 = l3;
 		if ((void *)(ip6 + 1) > data_end)
@@ -245,8 +301,30 @@ int xdp_floodgate(struct xdp_md *ctx)
 		// limited per IP, just not recognised as SYNs.
 		if (ip6->nexthdr == IPPROTO_TCP)
 			tcp = (void *)(ip6 + 1);
+		if (ip6->nexthdr == IPPROTO_IPIP || ip6->nexthdr == IPPROTO_IPV6) {
+			inner = (void *)(ip6 + 1);
+			inner_proto = ip6->nexthdr == IPPROTO_IPIP
+					      ? bpf_htons(ETH_P_IP)
+					      : bpf_htons(ETH_P_IPV6);
+		}
 	} else {
 		return verdict(FG_STAT_NOT_IP, bytes);
+	}
+
+	// Opt-in: trust the inner source only when the operator enabled
+	// decapsulation. A malformed inner header leaves the outer source in
+	// place instead of skipping the limit.
+	if (inner) {
+		__u32 *decap = bpf_map_lookup_elem(&settings, &zero);
+		if (decap && *decap) {
+			struct fg_ip_key inner_key = {};
+			struct tcphdr *inner_tcp = NULL;
+			if (parse_inner(inner, inner_proto, data_end,
+					&inner_key, &inner_tcp)) {
+				key = inner_key;
+				tcp = inner_tcp;
+			}
+		}
 	}
 
 	int is_syn = 0;

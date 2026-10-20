@@ -13,7 +13,7 @@ import (
 )
 
 func TestStartRejectsZeroMaxIPs(t *testing.T) {
-	if err := Start("lo", 0, true, Limits{}); err == nil {
+	if err := Start("lo", 0, true, false, Limits{}); err == nil {
 		t.Fatal("Start accepted max-ips 0")
 	}
 }
@@ -26,7 +26,7 @@ func TestLifecycle(t *testing.T) {
 		t.Skipf("%s already in use", PinDir)
 	}
 	lim := Limits{IP: Limit{Rate: 100, Burst: 10}, SYN: Limit{Rate: 10, Burst: 5}}
-	if err := Start("lo", 1024, true, lim); err != nil {
+	if err := Start("lo", 1024, true, true, lim); err != nil {
 		if strings.Contains(err.Error(), "bpffs") {
 			t.Skipf("bpffs not mounted: %v", err)
 		}
@@ -34,7 +34,7 @@ func TestLifecycle(t *testing.T) {
 	}
 	t.Cleanup(func() { _ = Stop() })
 
-	if err := Start("lo", 1024, true, lim); err == nil || !strings.Contains(err.Error(), "already attached") {
+	if err := Start("lo", 1024, true, true, lim); err == nil || !strings.Contains(err.Error(), "already attached") {
 		t.Errorf("second start error = %v, want already attached", err)
 	}
 
@@ -44,6 +44,9 @@ func TestLifecycle(t *testing.T) {
 	}
 	if got != lim {
 		t.Errorf("limits = %+v, want %+v", got, lim)
+	}
+	if decap, err := Decap(); err != nil || !decap {
+		t.Errorf("Decap() = %v, %v; want true", decap, err)
 	}
 
 	lim.IP.Rate = 7

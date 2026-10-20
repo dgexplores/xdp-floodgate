@@ -8,6 +8,8 @@ package loader
 import (
 	"encoding/binary"
 	"testing"
+
+	"github.com/cilium/ebpf"
 )
 
 // tcpHeader fills the 20-byte TCP header at p with the given flags.
@@ -168,5 +170,168 @@ func TestStatsBytes(t *testing.T) {
 	const frame = 14 + 20 + 20
 	if stats[0].Bytes != frame || stats[1].Bytes != frame {
 		t.Errorf("bytes pass=%d drop_ip=%d, want %d each", stats[0].Bytes, stats[1].Bytes, frame)
+	}
+}
+
+// ip4in4Packet wraps an inner IPv4+TCP packet in an outer IPv4 IPIP
+// header. Outer and inner sources differ so tests can tell which one the
+// data plane used.
+func ip4in4Packet(outer, inner [4]byte, flags byte) []byte {
+	p := make([]byte, 14+20+20+20)
+	binary.BigEndian.PutUint16(p[12:], 0x0800)
+	o := p[14:]
+	o[0] = 0x45
+	binary.BigEndian.PutUint16(o[2:], 60)
+	o[8] = 64
+	o[9] = 4 // IPIP
+	copy(o[12:], outer[:])
+	copy(o[16:], []byte{10, 0, 0, 100})
+	i := o[20:]
+	i[0] = 0x45
+	binary.BigEndian.PutUint16(i[2:], 40)
+	i[8] = 64
+	i[9] = 6
+	copy(i[12:], inner[:])
+	copy(i[16:], []byte{10, 0, 0, 200})
+	tcp := i[20:]
+	binary.BigEndian.PutUint16(tcp[0:], 40000)
+	binary.BigEndian.PutUint16(tcp[2:], 80)
+	tcp[12] = 5 << 4
+	tcp[13] = flags
+	return p
+}
+
+// ip6in4Packet wraps an inner IPv6+TCP packet in an outer IPv4 header
+// with protocol 41.
+func ip6in4Packet(outer [4]byte, inner [16]byte, flags byte) []byte {
+	p := make([]byte, 14+20+40+20)
+	binary.BigEndian.PutUint16(p[12:], 0x0800)
+	o := p[14:]
+	o[0] = 0x45
+	binary.BigEndian.PutUint16(o[2:], 80)
+	o[8] = 64
+	o[9] = 41 // IPv6
+	copy(o[12:], outer[:])
+	copy(o[16:], []byte{10, 0, 0, 100})
+	i := o[20:]
+	i[0] = 0x60
+	binary.BigEndian.PutUint16(i[4:], 20)
+	i[6] = 6
+	i[7] = 64
+	copy(i[8:24], inner[:])
+	copy(i[24:40], []byte{0x20, 0x01, 0x0d, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 100})
+	tcp := i[40:]
+	binary.BigEndian.PutUint16(tcp[0:], 40000)
+	binary.BigEndian.PutUint16(tcp[2:], 80)
+	tcp[12] = 5 << 4
+	tcp[13] = flags
+	return p
+}
+
+// ip4in6Packet wraps an inner IPv4+TCP packet in an outer IPv6 header.
+func ip4in6Packet(outer [16]byte, inner [4]byte, flags byte) []byte {
+	p := make([]byte, 14+40+20+20)
+	binary.BigEndian.PutUint16(p[12:], 0x86dd)
+	o := p[14:]
+	o[0] = 0x60
+	binary.BigEndian.PutUint16(o[4:], 40)
+	o[6] = 4 // IPIP
+	o[7] = 64
+	copy(o[8:24], outer[:])
+	copy(o[24:40], []byte{0x20, 0x01, 0x0d, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 100})
+	i := o[40:]
+	i[0] = 0x45
+	binary.BigEndian.PutUint16(i[2:], 40)
+	i[8] = 64
+	i[9] = 6
+	copy(i[12:], inner[:])
+	copy(i[16:], []byte{10, 0, 0, 200})
+	tcp := i[20:]
+	binary.BigEndian.PutUint16(tcp[0:], 40000)
+	binary.BigEndian.PutUint16(tcp[2:], 80)
+	tcp[12] = 5 << 4
+	tcp[13] = flags
+	return p
+}
+
+func runPackets(t *testing.T, objs *floodgateObjects, pkts [][]byte) int {
+	t.Helper()
+	passed := 0
+	for _, pkt := range pkts {
+		ret, err := objs.XdpFloodgate.Run(&ebpf.RunOptions{Data: pkt})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if ret == xdpPass {
+			passed++
+		}
+	}
+	return passed
+}
+
+func TestDecapIPv4Inner(t *testing.T) {
+	// Same inner source, different outer sources: with decap the shared
+	// inner bucket allows burst 2; without it every outer source is new.
+	inner := [4]byte{192, 0, 2, 7}
+	var pkts [][]byte
+	for i := 0; i < 10; i++ {
+		pkts = append(pkts, ip4in4Packet([4]byte{10, 9, 9, byte(i)}, inner, ackFlag))
+	}
+	on := loadTestObjectsDecap(t, Limits{IP: Limit{Rate: 1, Burst: 2}}, true)
+	if got := runPackets(t, on, pkts); got != 2 {
+		t.Errorf("decap on: %d passed, want 2", got)
+	}
+	off := loadTestObjectsDecap(t, Limits{IP: Limit{Rate: 1, Burst: 2}}, false)
+	if got := runPackets(t, off, pkts); got != 10 {
+		t.Errorf("decap off: %d passed, want 10", got)
+	}
+}
+
+func TestDecapIPv6Inner(t *testing.T) {
+	inner := [16]byte{0x20, 0x01, 0x0d, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 7}
+	var pkts [][]byte
+	for i := 0; i < 10; i++ {
+		pkts = append(pkts, ip6in4Packet([4]byte{10, 9, 9, byte(i)}, inner, ackFlag))
+	}
+	objs := loadTestObjectsDecap(t, Limits{IP: Limit{Rate: 1, Burst: 3}}, true)
+	if got := runPackets(t, objs, pkts); got != 3 {
+		t.Errorf("decap on: %d passed, want 3", got)
+	}
+}
+
+func TestDecapIPv4InnerFromIPv6Outer(t *testing.T) {
+	inner := [4]byte{192, 0, 2, 9}
+	var pkts [][]byte
+	for i := 0; i < 10; i++ {
+		outer := [16]byte{0x20, 0x01, 0x0d, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, byte(i)}
+		pkts = append(pkts, ip4in6Packet(outer, inner, ackFlag))
+	}
+	objs := loadTestObjectsDecap(t, Limits{IP: Limit{Rate: 1, Burst: 2}}, true)
+	if got := runPackets(t, objs, pkts); got != 2 {
+		t.Errorf("decap on: %d passed, want 2", got)
+	}
+}
+
+func TestDecapTrustedInner(t *testing.T) {
+	// The inner source matches the allowlist, so the trusted class (burst
+	// 5) applies instead of the default class (burst 1).
+	objs := loadTestObjectsDecap(t, Limits{
+		IP:        Limit{Rate: 1, Burst: 1},
+		TrustedIP: Limit{Rate: 1, Burst: 5},
+	}, true)
+	k, err := allowKey("192.0.2.7")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := objs.Allowlist.Put(&k, uint8(1)); err != nil {
+		t.Fatal(err)
+	}
+	inner := [4]byte{192, 0, 2, 7}
+	var pkts [][]byte
+	for i := 0; i < 10; i++ {
+		pkts = append(pkts, ip4in4Packet([4]byte{10, 9, 9, byte(i)}, inner, ackFlag))
+	}
+	if got := runPackets(t, objs, pkts); got != 5 {
+		t.Errorf("trusted inner: %d passed, want 5", got)
 	}
 }
